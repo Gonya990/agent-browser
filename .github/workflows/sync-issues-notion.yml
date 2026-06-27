@@ -1,0 +1,151 @@
+name: Sync Issue to Notion
+
+on:
+  issues:
+    types: [opened, reopened]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get issue type from labels
+        id: meta
+        run: |
+          LABELS='${{ toJson(github.event.issue.labels) }}'
+          TYPE="other"
+          echo "$LABELS" | python3 -c "
+          import sys, json
+          labels = json.load(sys.stdin)
+          names = [l['name'].lower() for l in labels]
+          t = 'other'
+          if any('bug' in n for n in names): t = 'bug'
+          elif any('feature' in n for n in names): t = 'feature'
+          elif any('enhancement' in n for n in names): t = 'enhancement'
+          elif any('question' in n for n in names): t = 'question'
+          print(f'type={t}')
+          " >> $GITHUB_OUTPUT
+
+          echo "$LABELS" | python3 -c "
+          import sys, json
+          labels = json.load(sys.stdin)
+          names = [l['name'].lower() for l in labels]
+          p = 'Medium'
+          if any(x in n for n in names for x in ['high','critical','urgent']): p = 'High'
+          elif any(x in n for n in names for x in ['low','wontfix']): p = 'Low'
+          print(f'priority={p}')
+          " >> $GITHUB_OUTPUT
+
+          echo "$LABELS" | python3 -c "
+          import sys, json
+          labels = json.load(sys.stdin)
+          names = [l['name'] for l in labels]
+          print('labels=' + ', '.join(names))
+          " >> $GITHUB_OUTPUT
+
+      - name: Create Notion page
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_ISSUES_DB_ID: ${{ secrets.NOTION_ISSUES_DB_ID }}
+        run: |
+          REPO="${{ github.event.repository.name }}"
+          NUM="${{ github.event.issue.number }}"
+          TITLE="${{ github.event.issue.title }}"
+          URL="${{ github.event.issue.html_url }}"
+          AUTHOR="${{ github.event.issue.user.login }}"
+          DATE=$(echo "${{ github.event.issue.created_at }}" | cut -c1-10)
+          TYPE="${{ steps.meta.outputs.type }}"
+          PRIORITY="${{ steps.meta.outputs.priority }}"
+          LABELS="${{ steps.meta.outputs.labels }}"
+
+          # Truncate body to 1800 chars, escape for JSON
+          BODY=$(cat << 'BODYEOF'
+          ${{ github.event.issue.body }}
+          BODYEOF
+          )
+          BODY_SHORT=$(echo "$BODY" | head -c 1800)
+
+          python3 << PYEOF
+          import json, sys, os, urllib.request
+
+          token = os.environ['NOTION_TOKEN']
+          db_id = os.environ['NOTION_ISSUES_DB_ID']
+
+          title_text = f"[#{os.environ.get('NUM', '')}] {os.environ.get('TITLE', '')}"
+          repo = os.environ.get('REPO', '')
+          url = os.environ.get('URL', '')
+          author = os.environ.get('AUTHOR', '')
+          date = os.environ.get('DATE', '')
+          issue_type = os.environ.get('TYPE', 'other')
+          priority = os.environ.get('PRIORITY', 'Medium')
+          labels = os.environ.get('LABELS', '')
+          num = os.environ.get('NUM', '')
+          body_short = """$BODY_SHORT"""[:1800]
+
+          payload = {
+            "parent": {"database_id": db_id},
+            "icon": {"emoji": "🐛"},
+            "properties": {
+              "Title": {"title": [{"text": {"content": title_text}}]},
+              "Repo": {"select": {"name": repo}},
+              "Status": {"select": {"name": "Open"}},
+              "Type": {"select": {"name": issue_type}},
+              "Priority": {"select": {"name": priority}},
+              "GitHub URL": {"url": url},
+              "Issue Number": {"rich_text": [{"text": {"content": f"#{num}"}}]},
+              "Author": {"rich_text": [{"text": {"content": author}}]},
+              "Labels": {"rich_text": [{"text": {"content": labels}}]},
+              "Opened At": {"date": {"start": date}}
+            },
+            "children": [
+              {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Description"}}]}
+              },
+              {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": body_short or "(no description)"}}]}
+              },
+              {
+                "object": "block",
+                "type": "divider",
+                "divider": {}
+              },
+              {
+                "object": "block",
+                "type": "bookmark",
+                "bookmark": {"url": url}
+              }
+            ]
+          }
+
+          data = json.dumps(payload).encode()
+          req = urllib.request.Request(
+            "https://api.notion.com/v1/pages",
+            data=data,
+            headers={
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json",
+              "Notion-Version": "2022-06-28"
+            },
+            method="POST"
+          )
+          with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+            page_url = result.get("url", "")
+            page_id = result.get("id", "")
+            print(f"✅ Notion page created: {page_url}")
+
+          PYEOF
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_ISSUES_DB_ID: ${{ secrets.NOTION_ISSUES_DB_ID }}
+          REPO: ${{ github.event.repository.name }}
+          TITLE: ${{ github.event.issue.title }}
+          URL: ${{ github.event.issue.html_url }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          NUM: ${{ github.event.issue.number }}
+          TYPE: ${{ steps.meta.outputs.type }}
+          PRIORITY: ${{ steps.meta.outputs.priority }}
+          LABELS: ${{ steps.meta.outputs.labels }}
