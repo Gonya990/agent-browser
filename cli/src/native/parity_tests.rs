@@ -397,12 +397,17 @@ async fn test_all_documented_actions_are_handled() {
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
         let id = format!("parity-{}", i);
         let cmd = minimal_command(action, &id);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            execute_command(&cmd, &mut state),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("Action '{}' timed out", action));
+        // A cold Chrome start on macOS x64 runners can legitimately exceed the
+        // generic action budget. Keep the tighter timeout for every reused
+        // browser action while giving the one real launch enough headroom.
+        let timeout = if *action == "launch" {
+            std::time::Duration::from_secs(30)
+        } else {
+            std::time::Duration::from_secs(10)
+        };
+        let result = tokio::time::timeout(timeout, execute_command(&cmd, &mut state))
+            .await
+            .unwrap_or_else(|_| panic!("Action '{}' timed out", action));
 
         assert!(
             result.get("id").is_some(),
