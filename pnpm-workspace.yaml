@@ -1,0 +1,35 @@
+packages:
+  - '.'
+  - 'packages/*'
+  - 'packages/@agent-browser/*'
+  - 'docs'
+overrides:
+  '@hono/node-server@1.19.11': 1.19.13
+  'brace-expansion@1.1.12': 1.1.13
+  'brace-expansion@5.0.5': 5.0.6
+  'dompurify@3.3.3': 3.4.11
+  'fast-uri@3.1.0': 3.1.2
+  'fast-xml-builder@1.1.4': 1.1.7
+  'fast-xml-parser@5.5.9': 5.7.0
+  'hono@4.12.9': 4.12.25
+  'ip-address@10.1.0': 10.1.1
+  'js-yaml@3.14.2': 3.15.0
+  'js-yaml@4.1.1': 4.3.0
+  'lodash-es@4.17.23': 4.18.1
+  'mermaid@11.13.0': 11.15.0
+  'path-to-regexp@8.3.0': 8.4.0
+  'picomatch@2.3.1': 2.3.2
+  'postcss': 8.5.10
+  'qs@6.15.0': 6.15.2
+  'uuid@11.1.0': 11.1.1
+minimumReleaseAge: 2880
+# First-party packages are exempt so @agent-browser/eve can depend on a
+# just-released @agent-browser/sandbox without waiting out the release age.
+minimumReleaseAgeExclude:
+  - '@agent-browser/sandbox'
+allowBuilds:
+  '@mongodb-js/zstd': false
+  msw: false
+  node-liblzma: false
+  sharp: false
+  unrs-resolver: false
