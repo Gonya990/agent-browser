@@ -2,10 +2,16 @@
 //! dir, and the optional lightpanda engine.
 
 use std::env;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use super::helpers::which_exists;
+use super::helpers::{new_id, which_exists};
 use super::{Check, Status};
+
+const VERSION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn check(checks: &mut Vec<Check>) {
     let category = "Chrome";
@@ -115,18 +121,108 @@ pub(super) fn check(checks: &mut Vec<Check>) {
 }
 
 fn query_chrome_version(path: &Path) -> Option<String> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    query_chrome_version_with_timeout(path, VERSION_QUERY_TIMEOUT)
+}
+
+fn query_chrome_version_with_timeout(path: &Path, timeout: Duration) -> Option<String> {
+    // Chrome is a GUI application on Windows. Some builds ignore --version
+    // and keep the process alive, which previously blocked `doctor --quick`
+    // indefinitely. Write stdout to a file instead of a pipe so a spawned
+    // descendant cannot keep the pipe open after the parent exits.
+    let output_path = env::temp_dir().join(format!(
+        "agent-browser-doctor-chrome-version-{}.txt",
+        new_id()
+    ));
+
+    let result = (|| {
+        let mut output_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&output_path)
+            .ok()?;
+        let child_stdout = output_file.try_clone().ok()?;
+
+        let mut child = Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(child_stdout))
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        };
+
+        if !status.success() {
+            return None;
+        }
+
+        output_file.seek(SeekFrom::Start(0)).ok()?;
+        let mut stdout = String::new();
+        output_file.read_to_string(&mut stdout).ok()?;
+        let version = stdout.trim().to_string();
+        if version.is_empty() {
+            None
+        } else {
+            Some(version)
+        }
+    })();
+
+    let _ = std::fs::remove_file(output_path);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn executable_script(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fake-chrome");
+        std::fs::write(&path, contents).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        (dir, path)
     }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+
+    #[cfg(unix)]
+    #[test]
+    fn chrome_version_query_reads_fast_command_output() {
+        let (_dir, path) = executable_script("#!/bin/sh\nprintf 'Fake Chrome 1.2.3\\n'\n");
+
+        assert_eq!(
+            query_chrome_version_with_timeout(&path, Duration::from_secs(1)).as_deref(),
+            Some("Fake Chrome 1.2.3")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chrome_version_query_kills_a_hung_command() {
+        let (_dir, path) = executable_script("#!/bin/sh\nsleep 10\n");
+        let started = Instant::now();
+
+        assert!(
+            query_chrome_version_with_timeout(&path, Duration::from_millis(100)).is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 
@@ -138,7 +234,7 @@ pub(super) fn puppeteer_cache_dir() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+mod cache_tests {
     use super::*;
 
     #[test]
