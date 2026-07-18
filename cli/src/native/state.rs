@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -14,6 +15,9 @@ use super::cdp::types::{
 };
 use super::cookies::{self, Cookie};
 use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
+
+const CROSS_ORIGIN_STORAGE_MAX_ATTEMPTS: usize = 3;
+const CROSS_ORIGIN_STORAGE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +57,16 @@ fn collect_frame_origins(tree: &Value, origins: &mut HashSet<String>) {
         for child in children {
             collect_frame_origins(child, origins);
         }
+    }
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" || origin.is_empty() {
+        None
+    } else {
+        Some(origin)
     }
 }
 
@@ -115,30 +129,64 @@ async fn collect_storage_via_temp_target(
     origins: &[String],
     origin_js: &str,
 ) -> Result<Vec<OriginStorage>, String> {
-    let create_result: CreateTargetResult = client
-        .send_command_typed(
-            "Target.createTarget",
-            &CreateTargetParams {
-                url: "about:blank".to_string(),
-            },
-            None,
-        )
-        .await?;
+    let mut last_error = "temporary target returned incomplete storage".to_string();
 
-    let target_id = create_result.target_id;
+    for attempt in 0..CROSS_ORIGIN_STORAGE_MAX_ATTEMPTS {
+        let attempt_result = match client
+            .send_command_typed(
+                "Target.createTarget",
+                &CreateTargetParams {
+                    url: "about:blank".to_string(),
+                },
+                None,
+            )
+            .await
+        {
+            Ok(create_result) => {
+                let create_result: CreateTargetResult = create_result;
+                let target_id = create_result.target_id;
+                let result =
+                    collect_storage_in_target(client, &target_id, origins, origin_js).await;
 
-    // Ensure the target is closed even if attach or later steps fail
-    let result = collect_storage_in_target(client, &target_id, origins, origin_js).await;
+                // Always close the disposable target, including failed attempts.
+                let _ = client
+                    .send_command_typed::<_, Value>(
+                        "Target.closeTarget",
+                        &CloseTargetParams { target_id },
+                        None,
+                    )
+                    .await;
 
-    let _ = client
-        .send_command_typed::<_, Value>(
-            "Target.closeTarget",
-            &CloseTargetParams { target_id },
-            None,
-        )
-        .await;
+                result
+            }
+            Err(error) => Err(error),
+        };
 
-    result
+        match attempt_result {
+            Ok(mut collected) if collected.len() == origins.len() => {
+                collected.retain(|storage| {
+                    !storage.local_storage.is_empty() || !storage.session_storage.is_empty()
+                });
+                return Ok(collected);
+            }
+            Ok(collected) => {
+                last_error = format!(
+                    "collected storage for {} of {} origins",
+                    collected.len(),
+                    origins.len()
+                );
+            }
+            Err(error) => last_error = error,
+        }
+
+        if attempt + 1 < CROSS_ORIGIN_STORAGE_MAX_ATTEMPTS {
+            tokio::time::sleep(CROSS_ORIGIN_STORAGE_RETRY_DELAY).await;
+        }
+    }
+
+    Err(format!(
+        "Failed to collect cross-origin storage after {CROSS_ORIGIN_STORAGE_MAX_ATTEMPTS} attempts: {last_error}"
+    ))
 }
 
 async fn collect_storage_in_target(
@@ -236,7 +284,9 @@ async fn collect_storage_in_target(
         }
 
         if let Some(storage) = eval_origin_storage(client, temp_session, origin_js).await {
-            if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
+            // Keep empty storage here so the caller can distinguish a successful
+            // read from a lost CDP session. Empty origins are filtered later.
+            if normalize_origin(&storage.origin) == normalize_origin(target_origin) {
                 results.push(storage);
             }
         }
@@ -298,11 +348,8 @@ pub async fn save_state(
     all_origins.remove(&current_origin);
     if !all_origins.is_empty() {
         let remaining: Vec<String> = all_origins.into_iter().collect();
-        if let Ok(temp_origins) =
-            collect_storage_via_temp_target(client, &remaining, origin_js).await
-        {
-            origins.extend(temp_origins);
-        }
+        let temp_origins = collect_storage_via_temp_target(client, &remaining, origin_js).await?;
+        origins.extend(temp_origins);
     }
 
     let state = StorageState { cookies, origins };
