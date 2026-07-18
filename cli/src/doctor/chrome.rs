@@ -219,9 +219,7 @@ mod tests {
         let (_dir, path) = executable_script("#!/bin/sh\nsleep 10\n");
         let started = Instant::now();
 
-        assert!(
-            query_chrome_version_with_timeout(&path, Duration::from_millis(100)).is_none()
-        );
+        assert!(query_chrome_version_with_timeout(&path, Duration::from_millis(100)).is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
