@@ -397,10 +397,9 @@ async fn test_all_documented_actions_are_handled() {
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
         let id = format!("parity-{}", i);
         let cmd = minimal_command(action, &id);
-        // A cold Chrome start on macOS x64 runners can legitimately exceed the
-        // generic action budget. Keep the tighter timeout for every reused
-        // browser action while giving the one real launch enough headroom.
-        let timeout = if *action == "launch" {
+        // Chrome startup and the first accessibility snapshot can both exceed
+        // the generic action budget on emulated macOS x64 runners.
+        let timeout = if matches!(*action, "launch" | "snapshot") {
             std::time::Duration::from_secs(30)
         } else {
             std::time::Duration::from_secs(10)
